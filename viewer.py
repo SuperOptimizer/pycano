@@ -2,291 +2,416 @@ import numpy as np
 import zarr
 from typing import List, Tuple
 import napari
-from magicgui import magicgui
-from scipy import ndimage
+import skimage
+from numba import njit, prange
+from qtpy.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QDoubleSpinBox,
+    QCheckBox, QPushButton, QFrame
+)
+from qtpy.QtCore import Qt
+
+import glcae
 
 
-class RGBVolumeViewer:
+@njit
+def get_neighbors_3d(z, y, x, depth, height, width):
+    directions = np.array([
+        [-1, 0, 0], [1, 0, 0],
+        [0, -1, 0], [0, 1, 0],
+        [0, 0, -1], [0, 0, 1]
+    ])
+
+    neighbors = []
+
+    for i in range(6):
+        nz = z + directions[i, 0]
+        ny = y + directions[i, 1]
+        nx = x + directions[i, 2]
+
+        if 0 <= nz < depth and 0 <= ny < height and 0 <= nx < width:
+            neighbors.append((nz, ny, nx))
+
+    return neighbors
+
+
+@njit
+def flood_fill_f32(volume, iso_threshold, start_threshold):
+    depth, height, width = volume.shape
+    mask = np.zeros_like(volume, dtype=np.uint8)
+    visited = np.zeros_like(volume, dtype=np.uint8)
+
+    iso_threshold_u8 = min(255, max(0, int(iso_threshold)))
+    start_threshold_u8 = min(255, max(0, int(start_threshold)))
+
+    max_queue_size = depth * height * width
+    queue_z = np.zeros(max_queue_size, dtype=np.int32)
+    queue_y = np.zeros(max_queue_size, dtype=np.int32)
+    queue_x = np.zeros(max_queue_size, dtype=np.int32)
+    queue_start = 0
+    queue_end = 0
+
+    for z in range(depth):
+        for y in range(height):
+            for x in range(width):
+                if volume[z, y, x] >= start_threshold_u8:
+                    queue_z[queue_end] = z
+                    queue_y[queue_end] = y
+                    queue_x[queue_end] = x
+                    queue_end += 1
+
+                    mask[z, y, x] = 1
+                    visited[z, y, x] = 1
+
+    directions = np.array([
+        [-1, 0, 0], [1, 0, 0],
+        [0, -1, 0], [0, 1, 0],
+        [0, 0, -1], [0, 0, 1]
+    ])
+
+    while queue_start < queue_end:
+        current_z = queue_z[queue_start]
+        current_y = queue_y[queue_start]
+        current_x = queue_x[queue_start]
+        queue_start += 1
+
+        for i in range(6):
+            nz = current_z + directions[i, 0]
+            ny = current_y + directions[i, 1]
+            nx = current_x + directions[i, 2]
+
+            if 0 <= nz < depth and 0 <= ny < height and 0 <= nx < width:
+                if visited[nz, ny, nx] == 0 and volume[nz, ny, nx] >= iso_threshold_u8:
+                    mask[nz, ny, nx] = 1
+                    visited[nz, ny, nx] = 1
+
+                    queue_z[queue_end] = nz
+                    queue_y[queue_end] = ny
+                    queue_x[queue_end] = nx
+                    queue_end += 1
+
+    return mask
+
+
+@njit(parallel=True)
+def segment_and_clean_u8(volume_u8, iso_threshold=127, start_threshold=200):
+    mask = flood_fill_f32(volume_u8, iso_threshold, start_threshold)
+
+    result = np.zeros_like(volume_u8)
+    for z in prange(volume_u8.shape[0]):
+        for y in range(volume_u8.shape[1]):
+            for x in range(volume_u8.shape[2]):
+                if mask[z, y, x]:
+                    result[z, y, x] = volume_u8[z, y, x]
+                else:
+                    result[z, y, x] = 0
+
+    return result
+
+
+@njit(parallel=True)
+def segment_and_clean_f32(volume_u8, iso_threshold=127, start_threshold=200):
+    mask = flood_fill_f32(volume_u8, iso_threshold, start_threshold)
+
+    result = np.zeros_like(volume_u8)
+    for z in prange(volume_u8.shape[0]):
+        for y in range(volume_u8.shape[1]):
+            for x in range(volume_u8.shape[2]):
+                if mask[z, y, x]:
+                    result[z, y, x] = volume_u8[z, y, x]
+                else:
+                    result[z, y, x] = 0
+
+    return result
+
+
+@njit(parallel=True)
+def avgpool_denoise_3d(volume_u8, kernel=3):
+    depth, height, width = volume_u8.shape
+    result = np.zeros_like(volume_u8)
+    half = kernel // 2
+
+    for z in prange(depth):
+        for y in range(height):
+            for x in range(width):
+                values = []
+
+                for zi in range(-half, half + 1):
+                    for yi in range(-half, half + 1):
+                        for xi in range(-half, half + 1):
+                            nz, ny, nx = z + zi, y + yi, x + xi
+
+                            if not (0 <= nz < depth and 0 <= ny < height and 0 <= nx < width):
+                                continue
+
+                            values.append(volume_u8[nz, ny, nx])
+
+                if values:
+                    result[z, y, x] = int(np.mean(values))
+
+    return result
+
+
+@njit
+def avgpool_denoise_3d_fast(volume_u8, kernel=3):
+    depth, height, width = volume_u8.shape
+    result = np.zeros_like(volume_u8)
+    half = kernel // 2
+
+    padded = np.zeros((depth + 2 * half, height + 2 * half, width + 2 * half), dtype=np.uint8)
+    padded[half:half + depth, half:half + height, half:half + width] = volume_u8
+
+    for z in prange(depth):
+        for y in range(height):
+            for x in range(width):
+                neighborhood = padded[z:z + kernel, y:y + kernel, x:x + kernel]
+                result[z, y, x] = int(np.mean(neighborhood))
+
+    return result
+
+
+class ChannelControls(QWidget):
+    def __init__(self, name, layer, color, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self.layer = layer
+        self.color = color
+
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        header = QLabel(f"<h3 style='color:{color}'>{name}</h3>")
+        layout.addWidget(header)
+
+        # Attenuation control - greatly extended range
+        att_layout = QHBoxLayout()
+        att_layout.addWidget(QLabel("Attenuation:"))
+
+        self.att_slider = QSlider(Qt.Horizontal)
+        self.att_slider.setMinimum(1)  # 0.0001 minimum (1/10000)
+        self.att_slider.setMaximum(100000)  # 10.0 maximum (100000/10000)
+        self.att_slider.setValue(int(layer.attenuation * 10000))
+        self.att_slider.valueChanged.connect(self.update_attenuation)
+        att_layout.addWidget(self.att_slider)
+
+        self.att_value = QDoubleSpinBox()
+        self.att_value.setRange(0.0001, 10.0)
+        self.att_value.setDecimals(4)  # Show 4 decimal places
+        self.att_value.setValue(layer.attenuation)
+        self.att_value.setSingleStep(0.01)
+        self.att_value.valueChanged.connect(self.update_attenuation_from_spinbox)
+        att_layout.addWidget(self.att_value)
+
+        layout.addLayout(att_layout)
+
+        # Gamma control - greatly extended range
+        gamma_layout = QHBoxLayout()
+        gamma_layout.addWidget(QLabel("Gamma:"))
+
+        self.gamma_slider = QSlider(Qt.Horizontal)
+        self.gamma_slider.setMinimum(1)  # 0.0001 minimum
+        self.gamma_slider.setMaximum(100000)  # 10.0 maximum
+        self.gamma_slider.setValue(int(layer.gamma * 10000))
+        self.gamma_slider.valueChanged.connect(self.update_gamma)
+        gamma_layout.addWidget(self.gamma_slider)
+
+        self.gamma_value = QDoubleSpinBox()
+        self.gamma_value.setRange(0.0001, 10.0)
+        self.gamma_value.setDecimals(4)  # Show 4 decimal places
+        self.gamma_value.setValue(layer.gamma)
+        self.gamma_value.setSingleStep(0.01)
+        self.gamma_value.valueChanged.connect(self.update_gamma_from_spinbox)
+        gamma_layout.addWidget(self.gamma_value)
+
+        layout.addLayout(gamma_layout)
+
+        # Visibility toggle
+        vis_layout = QHBoxLayout()
+        vis_layout.addWidget(QLabel("Visible:"))
+        self.vis_checkbox = QCheckBox()
+        self.vis_checkbox.setChecked(layer.visible)
+        self.vis_checkbox.stateChanged.connect(self.toggle_visibility)
+        vis_layout.addWidget(self.vis_checkbox)
+
+        layout.addLayout(vis_layout)
+
+    def update_attenuation(self, value):
+        att_value = value / 10000.0  # Convert from slider value to actual value
+        self.layer.attenuation = att_value
+        self.att_value.blockSignals(True)
+        self.att_value.setValue(att_value)
+        self.att_value.blockSignals(False)
+
+    def update_attenuation_from_spinbox(self, value):
+        self.layer.attenuation = value
+        self.att_slider.blockSignals(True)
+        self.att_slider.setValue(int(value * 10000))
+        self.att_slider.blockSignals(False)
+
+    def update_gamma(self, value):
+        gamma_value = value / 10000.0  # Convert from slider value to actual value
+        self.layer.gamma = gamma_value
+        self.gamma_value.blockSignals(True)
+        self.gamma_value.setValue(gamma_value)
+        self.gamma_value.blockSignals(False)
+
+    def update_gamma_from_spinbox(self, value):
+        self.layer.gamma = value
+        self.gamma_slider.blockSignals(True)
+        self.gamma_slider.setValue(int(value * 10000))
+        self.gamma_slider.blockSignals(False)
+
+    def toggle_visibility(self, state):
+        self.layer.visible = bool(state)
+
+
+class VolumeControlsDock(QWidget):
+    def __init__(self, layers, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Volume Controls")
+
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        self.channel_controls = []
+        colors = ['red', 'green', 'blue']
+        names = ['Red Channel', 'Green Channel', 'Blue Channel']
+
+        for i, (layer, color, name) in enumerate(zip(layers, colors, names)):
+            controls = ChannelControls(name, layer, color)
+            layout.addWidget(controls)
+            self.channel_controls.append(controls)
+
+            if i < len(layers) - 1:
+                separator = QFrame()
+                separator.setFrameShape(QFrame.HLine)
+                separator.setFrameShadow(QFrame.Sunken)
+                layout.addWidget(separator)
+
+        global_layout = QVBoxLayout()
+        global_label = QLabel("<h3>Global Settings</h3>")
+        global_layout.addWidget(global_label)
+
+        reset_button = QPushButton("Reset All")
+        reset_button.clicked.connect(self.reset_all)
+        global_layout.addWidget(reset_button)
+
+        layout.addLayout(global_layout)
+        layout.addStretch()
+
+    def reset_all(self):
+        for control in self.channel_controls:
+            control.att_value.setValue(0.1)
+            control.gamma_value.setValue(1.0)
+            control.vis_checkbox.setChecked(True)
+
+
+class SimpleRGBVolumeViewer:
     def __init__(self,
                  zarr_paths: List[str],
-                 start_coords: Tuple[int, int, int],
-                 size_coords: Tuple[int, int, int],
-                 threshold: int = 32,
-                 sigma: float = 1.0):
-        """
-        Initialize viewer for RGB volume visualization.
-
-        Args:
-            zarr_paths: Paths to three zarr files [red, green, blue]
-            start_coords: (z,y,x) starting coordinates for chunk extraction
-            size_coords: (z,y,x) size of chunk to extract
-            threshold: ISO threshold for visualization
-            sigma: Gaussian blur sigma
-        """
+                 start_coords: Tuple[int, int, int] = (0, 0, 0),
+                 size_coords: Tuple[int, int, int] = None):
         if len(zarr_paths) != 3:
             raise ValueError("Need exactly three zarr paths")
 
-        # Load zarr arrays and get volume shape
         arrays = [zarr.open(path, mode='r') for path in zarr_paths]
+        print(f"Input data type: {arrays[0].dtype}")
         self.shape = arrays[0].shape
+        self.start = start_coords
 
-        # Validate coordinates
-        self.start = self._validate_start(start_coords)
-        self.size = self._validate_size(start_coords, size_coords)
+        if size_coords is None:
+            self.size = self.shape
+            self.size = self.size[0], self.size[1], self.size[2]
+        else:
+            self.size = size_coords
 
-        # Load chunks and combine into RGB volume
-        self.volume = self._load_rgb_volume(arrays, sigma)
-        self.threshold = threshold
-
-        # Initialize viewer and create visualization
+        self.channels = self._load_channels(arrays)
         self.viewer = napari.Viewer(ndisplay=3)
-        self._create_layers()
-        self._add_controls()
-        self._add_axes()
+        self._add_color_channels()
+        self._add_control_dock()
 
-    def _validate_start(self, start):
-        """Validate start coordinates are within volume bounds."""
-        if len(start) != 3:
-            raise ValueError(f"Expected (z,y,x) start coordinates, got {len(start)}")
-
-        for i, (pos, size) in enumerate(zip(start, self.shape)):
-            if pos < 0 or pos >= size:
-                raise ValueError(f"Start position {pos} is outside volume bounds [0,{size}) in dimension {i}")
-
-        return start
-
-    def _validate_size(self, start, size):
-        """Validate and adjust size to fit within volume bounds."""
-        if len(size) != 3:
-            raise ValueError(f"Expected (z,y,x) size coordinates, got {len(size)}")
-
-        adjusted = []
-        for i, (begin, length, total) in enumerate(zip(start, size, self.shape)):
-            if length <= 0:
-                raise ValueError(f"Size must be positive, got {length} in dimension {i}")
-            adjusted.append(min(length, total - begin))
-
-        return tuple(adjusted)
-
-    def _load_rgb_volume(self, arrays, sigma):
-        """
-        Load and combine zarr arrays into a single RGB volume.
-
-        Returns:
-            numpy array of shape (D,H,W,3) with dtype uint8
-        """
+    def _load_channels(self, arrays):
         channels = []
-        for arr in arrays:
-            # Extract chunk
+        for i, arr in enumerate(arrays):
             chunk = arr[
                     self.start[0]:self.start[0] + self.size[0],
                     self.start[1]:self.start[1] + self.size[1],
                     self.start[2]:self.start[2] + self.size[2]
                     ]
+            chunk[chunk < 32] = 1
+            min_val = np.min(chunk)
+            max_val = np.max(chunk)
+            if max_val > min_val:
+                chunk = (((chunk - min_val) / (max_val - min_val)) * 255).astype(np.uint8)
+            else:
+                raise ValueError("Zero range in channel")
+            chunk = skimage.exposure.equalize_hist(chunk)
+            chunk = glcae.global_and_local_contrast_enhancement_3d(chunk)
+            chunk = avgpool_denoise_3d_fast(chunk,kernel=3)
+            min_val = np.min(chunk)
+            max_val = np.max(chunk)
+            chunk = (((chunk - min_val) / (max_val - min_val)) * 255).astype(np.uint8)
 
             channels.append(chunk)
+            print(
+                f"Channel {i} stats after conversion: min={np.min(chunk)}, max={np.max(chunk)}, mean={np.mean(chunk):.2f}")
+        return channels
 
-        # Stack R,G,B channels
-        rgb = np.stack(channels, axis=-1)  # Shape: (D,H,W,3)
-        return rgb
+        return [
+            np.abs(channels[1] - channels[0]),
+            np.abs(channels[1]),
+            np.abs(channels[1] - channels[2])
+        ]
 
-    def _create_layers(self):
-        """Create individual channel layers for RGB visualization."""
-        colors = [('red', 'Red'), ('green', 'Green'), ('blue', 'Blue')]
+        return [
+            np.abs(channels[0] - channels[1]),
+            np.abs(channels[1] - channels[2]),
+            np.abs(channels[2] - channels[0])
+        ]
+
+    def _add_color_channels(self):
+        colors = ['red', 'green', 'blue']
+        names = ['Red Channel', 'Green Channel', 'Blue Channel']
+
         self.layers = []
 
-        for i, (color, name) in enumerate(colors):
+        for i, (channel, color, name) in enumerate(zip(self.channels, colors, names)):
             layer = self.viewer.add_image(
-                self.volume[..., i],  # Individual channel
-                name=f"{name} Channel",
+                channel,
+                name=name,
+                colormap=color,
                 blending='additive',
                 rendering='attenuated_mip',
-                colormap=color,
-                visible=True,
-                attenuation=0.01,
-                contrast_limits=[self.threshold, 255],
-                gamma=0.85
+                attenuation=0.1,
+                contrast_limits=[0, 255],
+                gamma=1.0,
             )
             self.layers.append(layer)
 
-    def _add_controls(self):
-        """Add GUI controls for visualization parameters."""
+        print(f"Added 3 separate channels with individual coloring")
 
-        @magicgui(
-            auto_call=True,
-            red_threshold={"widget_type": "SpinBox",
-                           "min": 0,
-                           "max": 255,
-                           "label": "Red Threshold",
-                           "value": self.threshold},
-            green_threshold={"widget_type": "SpinBox",
-                             "min": 0,
-                             "max": 255,
-                             "label": "Green Threshold",
-                             "value": self.threshold},
-            blue_threshold={"widget_type": "SpinBox",
-                            "min": 0,
-                            "max": 255,
-                            "label": "Blue Threshold",
-                            "value": self.threshold},
-            red_attenuation={"widget_type": "FloatSpinBox",
-                             "min": -2,
-                             "max": 2,
-                             "label": "Red Attenuation",
-                             "value": 0.1,
-                             "step": 0.1},
-            green_attenuation={"widget_type": "FloatSpinBox",
-                               "min": -2,
-                               "max": 2,
-                               "label": "Green Attenuation",
-                               "value": 0.1,
-                               "step": 0.1},
-            blue_attenuation={"widget_type": "FloatSpinBox",
-                              "min": -2,
-                              "max": 2,
-                              "label": "Blue Attenuation",
-                              "value": 0.1,
-                              "step": 0.1},
-            gamma={"widget_type": "FloatSpinBox",
-                   "min": 0.1,
-                   "max": 5.0,
-                   "label": "Gamma",
-                   "value": 0.85,
-                   "step": 0.05}
+    def _add_control_dock(self):
+        self.control_dock = VolumeControlsDock(self.layers)
+        self.viewer.window.add_dock_widget(
+            self.control_dock,
+            name="Volume Controls",
+            area="right"
         )
-        def control_panel(
-                red_threshold: int = self.threshold,
-                green_threshold: int = self.threshold,
-                blue_threshold: int = self.threshold,
-                red_attenuation: float = 0.01,
-                green_attenuation: float = 0.01,
-                blue_attenuation: float = 0.01,
-                gamma: float = 0.85
-        ):
-            # Update thresholds
-            thresholds = [red_threshold, green_threshold, blue_threshold]
-            attenuations = [red_attenuation, green_attenuation, blue_attenuation]
-
-            for layer, threshold, attenuation in zip(self.layers, thresholds, attenuations):
-                layer.contrast_limits = [threshold, 255]
-                layer.attenuation = attenuation
-                layer.gamma = gamma
-
-        self.viewer.window.add_dock_widget(control_panel)
-
-    def _add_axes(self):
-        """Add axes and orientation indicators to the viewer."""
-        # Add axes to viewer
-        self.viewer.axes.visible = True
-        self.viewer.axes.colored = True
-        self.viewer.axes.labels = True
-        self.viewer.axes.dashed = True
-
-        # Add scale bar
-        self.viewer.scale_bar.visible = True
-        self.viewer.scale_bar.unit = "px"
-
-        # NOTE: In napari, dimensions are displayed as (0, 1, 2)
-        # But they correspond to the array dimensions (z, y, x)
-        # However, in the 3D view, these often get mapped as:
-        # Dimension 0 (z in our array) → X axis in display
-        # Dimension 1 (y in our array) → Y axis in display
-        # Dimension 2 (x in our array) → Z axis in display
-
-        # Create points at origin and along axes
-        origin = np.array([0, 0, 0])
-        axis_0_point = np.array([self.size[0] * 0.2, 0, 0])  # Dimension 0 (z in array)
-        axis_1_point = np.array([0, self.size[1] * 0.2, 0])  # Dimension 1 (y in array)
-        axis_2_point = np.array([0, 0, self.size[2] * 0.2])  # Dimension 2 (x in array)
-
-        # Create vectors for axes
-        axis_0 = np.stack([origin, axis_0_point])
-        axis_1 = np.stack([origin, axis_1_point])
-        axis_2 = np.stack([origin, axis_2_point])
-
-        # Add vectors as separate shape layers
-        self.viewer.add_shapes(
-            axis_0,
-            shape_type='line',
-            edge_color='red',
-            edge_width=5,
-            name='Dimension 0 (+Z in array)'
-        )
-
-        self.viewer.add_shapes(
-            axis_1,
-            shape_type='line',
-            edge_color='green',
-            edge_width=5,
-            name='Dimension 1 (+Y in array)'
-        )
-
-        self.viewer.add_shapes(
-            axis_2,
-            shape_type='line',
-            edge_color='blue',
-            edge_width=5,
-            name='Dimension 2 (+X in array)'
-        )
-
-        # Add text labels
-        labels = np.array([
-            [self.size[0] * 0.25, 0, 0],  # Dimension 0
-            [0, self.size[1] * 0.25, 0],  # Dimension 1
-            [0, 0, self.size[2] * 0.25],  # Dimension 2
-        ])
-
-        texts = ['Dim 0 (Z)', 'Dim 1 (Y)', 'Dim 2 (X)']
-
-        self.viewer.add_points(
-            labels,
-            name='Dimension Labels',
-            text={
-                'string': texts,
-                'color': 'white',
-                'size': 12
-            },
-            face_color='transparent',
-            opacity=1.0,
-            size=0
-        )
-
-        # Print dimensional information
-        print("\nDimensional information:")
-        print(f"Dimension 0 corresponds to Z in the array (shape: {self.volume.shape[0]})")
-        print(f"Dimension 1 corresponds to Y in the array (shape: {self.volume.shape[1]})")
-        print(f"Dimension 2 corresponds to X in the array (shape: {self.volume.shape[2]})")
-        print("\nNOTE: In the napari 3D view, these dimensions may be displayed differently.")
-        print("Use the dimension slider controls to confirm which slider affects which dimension.")
-
-        # Print navigation help
-        print("\nNavigation tips:")
-        print("- Use mouse to rotate view (hold left button and drag)")
-        print("- Use mouse wheel to zoom in/out")
-        print("- Hold Shift + left mouse button to pan")
-        print("- Press '3' to reset view")
-        print("- Press '2' to toggle between 2D/3D view")
 
     def run(self):
-        """Start the viewer."""
-        # Print some guidance for the viewer
-        print(f"Loaded volume with dimensions: {self.volume.shape}")
-        print(f"Starting at coordinates: {self.start}")
-        print(f"Size of chunk: {self.size}")
+        print(f"Starting viewer with 3 colored channels and custom controls")
         napari.run()
 
 
 if __name__ == "__main__":
-    # Example usage
     paths = [
-        "D:/53kev_1",  # Red channel
-        "D:/70kev_1",  # Green channel
-        "D:/88kev_1"  # Blue channel
+        "/Users/forrest/frag6/53kev_3",
+        "/Users/forrest/frag6/70kev_3",
+        "/Users/forrest/frag6/88kev_3"
     ]
 
-    start = (3072-256, 0, 2048-256)  # Starting coordinates (z,y,x)
-    size = (1024, 1024, 1024)  # Chunk size (z,y,x)
-    threshold = 32  # Visualization threshold
-
-    viewer = RGBVolumeViewer(paths, start, size, threshold)
+    viewer = SimpleRGBVolumeViewer(
+        paths,
+        (0, 0, 0),
+        (512, 512, 512)
+    )
     viewer.run()
